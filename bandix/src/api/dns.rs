@@ -1,6 +1,7 @@
 use super::{ApiResponse, HttpRequest, HttpResponse};
 use crate::command::Options;
 use crate::monitor::DnsQueryRecord;
+use crate::storage::dns;
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -184,7 +185,7 @@ impl DnsApiHandler {
 
 impl DnsApiHandler {
     pub fn supported_routes(&self) -> Vec<&'static str> {
-        vec!["/api/dns/queries", "/api/dns/stats", "/api/dns/config"]
+        vec!["/api/dns/queries", "/api/dns/stats", "/api/dns/config", "/api/dns/persist"]
     }
 
     pub async fn handle_request(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
@@ -206,6 +207,10 @@ impl DnsApiHandler {
             "/api/dns/config" => match request.method.as_str() {
                 "GET" => self.handle_get_config().await,
                 "POST" => self.handle_set_config(request).await,
+                _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
+            },
+            "/api/dns/persist" => match request.method.as_str() {
+                "POST" => self.handle_persist().await,
                 _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
             },
             _ => Ok(HttpResponse::not_found()),
@@ -358,7 +363,8 @@ impl DnsApiHandler {
     ///
     /// 查询参数：
     /// - domain: 按域名过滤（子串匹配）
-    /// - device: 按设备 MAC 或主机名过滤（子串匹配）
+    /// - device: 按设备 MAC、主机名或 IP 地址过滤（子串匹配）
+    ///           设备 IP 在查询记录中为 source_ip，在响应记录中为 destination_ip
     /// - is_query: 按查询类型过滤（true=查询，false=响应）
     /// - query_type: 按 DNS 记录类型过滤（例如：A, AAAA, CNAME, MX, TXT, NS, SOA, PTR）
     /// - dns_server: 按 DNS 服务器 IP 地址过滤（查询时为 destination_ip，响应时为 source_ip）
@@ -409,11 +415,14 @@ impl DnsApiHandler {
                     }
                 }
 
-                // 按设备过滤（MAC 或主机名，大小写不敏感的子串匹配）
+                // 按设备过滤（MAC、主机名或 IP 地址，大小写不敏感的子串匹配）
+                // 设备 IP：查询记录中为 source_ip，响应记录中为 destination_ip
                 if let Some(ref device) = device_filter {
                     let mac_match = q.device_mac.to_lowercase().contains(device);
                     let name_match = q.device_name.to_lowercase().contains(device);
-                    if !mac_match && !name_match {
+                    let device_ip = if q.is_query { &q.source_ip } else { &q.destination_ip };
+                    let ip_match = device_ip.contains(device);
+                    if !mac_match && !name_match && !ip_match {
                         return false;
                     }
                 }
@@ -865,5 +874,23 @@ impl DnsApiHandler {
             501,
             "DNS configuration update not yet implemented".to_string(),
         ))
+    }
+
+    async fn handle_persist(&self) -> Result<HttpResponse, anyhow::Error> {
+        if !self.options.dns_enable_storage() {
+            return Ok(HttpResponse::error(
+                400,
+                "DNS storage is not enabled (use --dns-enable-storage)".to_string(),
+            ));
+        }
+        let records = self
+            .dns_queries
+            .lock()
+            .map_err(|e| anyhow::anyhow!("dns_queries lock poisoned: {}", e))?
+            .clone();
+        dns::save_dns_queries(self.options.data_dir(), &records, self.options.dns_max_records())?;
+        let api_response = ApiResponse::success(());
+        let body = serde_json::to_string(&api_response)?;
+        Ok(HttpResponse::ok(body))
     }
 }

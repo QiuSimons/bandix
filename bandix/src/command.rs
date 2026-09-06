@@ -13,6 +13,46 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::signal;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcOrder {
+    First,
+    Default,
+    Last,
+    Before,
+    After,
+}
+
+impl TcOrder {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "first" => Some(Self::First),
+            "default" => Some(Self::Default),
+            "last" => Some(Self::Last),
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcBackend {
+    Auto,
+    Tcx,
+    Netlink,
+}
+
+impl TcBackend {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "tcx" => Some(Self::Tcx),
+            "netlink" => Some(Self::Netlink),
+            _ => None,
+        }
+    }
+}
+
 /// 所有命令共享的通用参数
 #[derive(Debug, Args, Clone)]
 pub struct CommonArgs {
@@ -38,10 +78,35 @@ pub struct CommonArgs {
 
     #[clap(
         long,
-        default_value = "0",
-        help = "TC filter priority (lower number = higher priority, 0 = kernel auto-assign). Use this to control execution order when running alongside other eBPF TC programs."
+        default_value = "default",
+        help = "TC order: first, default, last, before, after"
     )]
-    pub tc_priority: u16,
+    pub tc_order: String,
+
+    #[clap(
+        long,
+        default_value = "auto",
+        help = "TC attach backend: auto, tcx, netlink (default: auto)"
+    )]
+    pub tc_backend: String,
+
+    #[clap(
+        long = "netlink-priority",
+        help = "Netlink priority (0..65535, 0 means default). Only used when netlink backend is active"
+    )]
+    pub netlink_priority: Option<u16>,
+
+    #[clap(
+        long = "tcx-anchor-ingress-id",
+        help = "TCX ingress anchor program id. Used when tc-order is before/after"
+    )]
+    pub tcx_anchor_ingress_id: Option<u32>,
+
+    #[clap(
+        long = "tcx-anchor-egress-id",
+        help = "TCX egress anchor program id. Used when tc-order is before/after"
+    )]
+    pub tcx_anchor_egress_id: Option<u32>,
 }
 
 /// 流量模块参数
@@ -92,6 +157,27 @@ pub struct TrafficArgs {
         help = "Additional local subnets (comma-separated CIDR notation, e.g. '192.168.2.0/24,10.0.0.0/8'). Empty = only interface subnet."
     )]
     pub traffic_additional_subnets: String,
+
+    #[clap(
+        long,
+        default_value = "false",
+        help = "Exclude iface interface device (router) from traffic statistics"
+    )]
+    pub traffic_exclude_iface_device: bool,
+
+    #[clap(
+        long,
+        default_value = "false",
+        help = "Enable periodic neighbor table flush (ip neigh flush). Only takes effect when traffic module is enabled. Flushing affects all programs using the interface."
+    )]
+    pub traffic_neighbor_flush_enable: bool,
+
+    #[clap(
+        long,
+        default_value = "600",
+        help = "Traffic neighbor flush interval in seconds (default: 600). Only used when traffic-neighbor-flush-enable is true."
+    )]
+    pub traffic_neighbor_flush_interval: u32,
 }
 
 /// DNS 模块参数
@@ -173,9 +259,26 @@ impl Options {
         &self.common.log_level
     }
 
-    /// 从通用参数获取 TC 优先级
-    pub fn tc_priority(&self) -> u16 {
-        self.common.tc_priority
+    /// 从通用参数获取 TC 顺序
+    pub fn tc_order(&self) -> TcOrder {
+        TcOrder::parse(&self.common.tc_order).expect("tc_order must be validated before use")
+    }
+
+    /// 从通用参数获取 TC 后端
+    pub fn tc_backend(&self) -> TcBackend {
+        TcBackend::parse(&self.common.tc_backend).expect("tc_backend must be validated before use")
+    }
+
+    pub fn netlink_priority(&self) -> Option<u16> {
+        self.common.netlink_priority
+    }
+
+    pub fn tcx_anchor_ingress_id(&self) -> Option<u32> {
+        self.common.tcx_anchor_ingress_id
+    }
+
+    pub fn tcx_anchor_egress_id(&self) -> Option<u32> {
+        self.common.tcx_anchor_egress_id
     }
 
     /// 从流量参数获取启用流量
@@ -208,6 +311,18 @@ impl Options {
 
     pub fn traffic_additional_subnets(&self) -> &str {
         &self.traffic.traffic_additional_subnets
+    }
+
+    pub fn traffic_exclude_iface_device(&self) -> bool {
+        self.traffic.traffic_exclude_iface_device
+    }
+
+    pub fn traffic_neighbor_flush_enable(&self) -> bool {
+        self.traffic.traffic_neighbor_flush_enable
+    }
+
+    pub fn traffic_neighbor_flush_interval(&self) -> u32 {
+        self.traffic.traffic_neighbor_flush_interval
     }
 
     /// 从 DNS 参数获取启用 DNS
@@ -288,6 +403,30 @@ fn parse_cidr(cidr: &str) -> Result<([u8; 4], [u8; 4]), anyhow::Error> {
     Ok((network_addr, subnet_mask))
 }
 
+pub fn build_allowed_ipv4_subnets(
+    subnet_info: &SubnetInfo,
+    additional_subnets: &str,
+) -> Vec<([u8; 4], [u8; 4])> {
+    let mut subnets = Vec::new();
+    let net: [u8; 4] = [
+        subnet_info.interface_ip[0] & subnet_info.subnet_mask[0],
+        subnet_info.interface_ip[1] & subnet_info.subnet_mask[1],
+        subnet_info.interface_ip[2] & subnet_info.subnet_mask[2],
+        subnet_info.interface_ip[3] & subnet_info.subnet_mask[3],
+    ];
+    subnets.push((net, subnet_info.subnet_mask));
+    for cidr in additional_subnets.split(',') {
+        let cidr = cidr.trim();
+        if cidr.is_empty() {
+            continue;
+        }
+        if let Ok((net, mask)) = parse_cidr(cidr) {
+            subnets.push((net, mask));
+        }
+    }
+    subnets
+}
+
 // 验证参数
 fn validate_arguments(opt: &Options) -> Result<(), anyhow::Error> {
     // 检查网络接口是否存在
@@ -298,6 +437,39 @@ fn validate_arguments(opt: &Options) -> Result<(), anyhow::Error> {
     // 检查端口是否有效（0-65535）
     if opt.port() == 0 {
         return Err(anyhow::anyhow!("Port number cannot be 0"));
+    }
+
+    let tc_order = TcOrder::parse(&opt.common.tc_order).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid tc-order: {}. Valid: first, default, last, before, after",
+            opt.common.tc_order
+        )
+    })?;
+    let tc_backend = TcBackend::parse(&opt.common.tc_backend)
+        .ok_or_else(|| anyhow::anyhow!("Invalid tc-backend: {}. Valid: auto, tcx, netlink", opt.common.tc_backend))?;
+    if opt.netlink_priority().is_some() && tc_backend == TcBackend::Tcx {
+        anyhow::bail!("--netlink-priority cannot be used with --tc-backend=tcx");
+    }
+    match tc_order {
+        TcOrder::Before | TcOrder::After => {
+            let has_ingress = opt.tcx_anchor_ingress_id().is_some();
+            let has_egress = opt.tcx_anchor_egress_id().is_some();
+            if !has_ingress && !has_egress {
+                anyhow::bail!(
+                    "anchor program id is required when --tc-order is before/after; use --tcx-anchor-ingress-id/--tcx-anchor-egress-id"
+                );
+            }
+            if tc_backend == TcBackend::Netlink {
+                anyhow::bail!("--tc-order=before/after is only supported with tcx backend");
+            }
+        }
+        _ => {
+            if opt.tcx_anchor_ingress_id().is_some() || opt.tcx_anchor_egress_id().is_some() {
+                anyhow::bail!(
+                    "--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after"
+                );
+            }
+        }
     }
 
     // 仅在启用流量模块时验证流量特定参数
@@ -322,6 +494,12 @@ fn validate_arguments(opt: &Options) -> Result<(), anyhow::Error> {
                 parse_cidr(subnet_cidr).map_err(|e| anyhow::anyhow!("Invalid subnet CIDR '{}': {}", subnet_cidr, e))?;
             }
         }
+
+        if opt.traffic_neighbor_flush_enable() && opt.traffic_neighbor_flush_interval() == 0 {
+            return Err(anyhow::anyhow!(
+                "traffic_neighbor_flush_interval must be greater than 0 when traffic_neighbor_flush_enable is true"
+            ));
+        }
     }
 
     Ok(())
@@ -329,7 +507,15 @@ fn validate_arguments(opt: &Options) -> Result<(), anyhow::Error> {
 
 // 初始化共享的 eBPF 程序（被流量和 DNS 模块共同使用）
 async fn init_shared_ebpf(options: &Options) -> Result<aya::Ebpf, anyhow::Error> {
-    load_shared(options.iface().to_string(), options.tc_priority()).await
+    load_shared(
+        options.iface().to_string(),
+        options.tc_order(),
+        options.tc_backend(),
+        options.netlink_priority(),
+        options.tcx_anchor_ingress_id(),
+        options.tcx_anchor_egress_id(),
+    )
+    .await
 }
 
 // 子网信息结构体（跨模块共享）
@@ -622,6 +808,46 @@ fn start_hostname_refresh_task(
     })
 }
 
+fn start_neighbor_flush_task(
+    iface: String,
+    interval_secs: u64,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if std::process::Command::new("ip")
+                        .args(["-4", "neigh", "flush", "dev", &iface])
+                        .output()
+                        .map(|o| !o.status.success())
+                        .unwrap_or(true)
+                    {
+                        log::warn!("ip -4 neigh flush dev {} failed", iface);
+                    }
+                    if std::process::Command::new("ip")
+                        .args(["-6", "neigh", "flush", "dev", &iface])
+                        .output()
+                        .map(|o| !o.status.success())
+                        .unwrap_or(true)
+                    {
+                        log::warn!("ip -6 neigh flush dev {} failed", iface);
+                    }
+                    log::debug!("Neighbor table flushed for {}", iface);
+                }
+                _ = shutdown_notify.notified() => {
+                    log::info!("Neighbor flush task received shutdown signal, stopping...");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 // 运行服务
 async fn run_service(options: &Options) -> Result<(), anyhow::Error> {
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -643,10 +869,13 @@ async fn run_service(options: &Options) -> Result<(), anyhow::Error> {
     let shared_hostname_bindings: Arc<Mutex<std::collections::HashMap<[u8; 6], String>>> =
         Arc::new(Mutex::new(hostname_bindings_vec.into_iter().collect()));
 
+    let allowed_ipv4_subnets = build_allowed_ipv4_subnets(&subnet_info, options.traffic_additional_subnets());
     let device_manager = Arc::new(DeviceManager::new(
         options.iface().to_string(),
         subnet_info.clone(),
+        allowed_ipv4_subnets,
         Arc::clone(&shared_hostname_bindings),
+        options.traffic_exclude_iface_device(),
     ));
 
     // 首次刷新邻居表，获取局域网设备
@@ -687,6 +916,15 @@ async fn run_service(options: &Options) -> Result<(), anyhow::Error> {
     tasks.push(web_task);
     tasks.push(hostname_refresh_task);
     tasks.push(device_refresh_task);
+
+    if options.enable_traffic() && options.traffic_neighbor_flush_enable() {
+        let neighbor_flush_task = start_neighbor_flush_task(
+            options.iface().to_string(),
+            options.traffic_neighbor_flush_interval() as u64,
+            shutdown_notify.clone(),
+        );
+        tasks.push(neighbor_flush_task);
+    }
 
     // 等待关闭信号
     shutdown_notify.notified().await;

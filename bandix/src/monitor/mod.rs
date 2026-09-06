@@ -6,6 +6,7 @@ use crate::api::ApiRouter;
 use crate::command::Options;
 use crate::device::DeviceManager;
 use crate::storage::traffic::{LongTermRingManager, RealtimeRingManager, ScheduledRateLimit};
+use crate::storage::quota::TrafficQuotaManager;
 use std::collections::HashMap as StdHashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ pub struct TrafficModuleContext {
     pub rate_limit_whitelist: Arc<Mutex<HashSet<[u8; 6]>>>,
     pub rate_limit_whitelist_enabled: Arc<AtomicBool>,
     pub default_wan_rate_limits: Arc<Mutex<[u64; 2]>>,
+    pub traffic_quota_manager: Arc<Mutex<TrafficQuotaManager>>,
     pub realtime_manager: Arc<RealtimeRingManager>,  // 实时1秒采样（仅内存）
     pub long_term_manager: Arc<LongTermRingManager>, // 长期采样（1小时间隔，365天保留，已持久化）
     pub device_manager: Arc<DeviceManager>,          // 统一的设备管理器（包含设备信息和流量统计）
@@ -49,6 +51,7 @@ impl TrafficModuleContext {
         let rate_limit_whitelist = Arc::new(Mutex::new(HashSet::new()));
         let rate_limit_whitelist_enabled = Arc::new(AtomicBool::new(false));
         let default_wan_rate_limits = Arc::new(Mutex::new([0u64; 2]));
+        let traffic_quota_manager = Arc::new(Mutex::new(TrafficQuotaManager::new(options.data_dir())));
 
         Self {
             options,
@@ -57,6 +60,7 @@ impl TrafficModuleContext {
             rate_limit_whitelist,
             rate_limit_whitelist_enabled,
             default_wan_rate_limits,
+            traffic_quota_manager,
             realtime_manager,
             long_term_manager,
             device_manager,
@@ -135,6 +139,7 @@ impl Clone for ModuleContext {
                 rate_limit_whitelist: Arc::clone(&ctx.rate_limit_whitelist),
                 rate_limit_whitelist_enabled: Arc::clone(&ctx.rate_limit_whitelist_enabled),
                 default_wan_rate_limits: Arc::clone(&ctx.default_wan_rate_limits),
+                traffic_quota_manager: Arc::clone(&ctx.traffic_quota_manager),
                 realtime_manager: Arc::clone(&ctx.realtime_manager),
                 long_term_manager: Arc::clone(&ctx.long_term_manager),
                 device_manager: Arc::clone(&ctx.device_manager),
@@ -192,6 +197,8 @@ impl ModuleType {
                     }
                 }
 
+                traffic_ctx.traffic_quota_manager.lock().unwrap().load()?;
+
                 // 如果开启了持久化，那么从历史数据，加载基线流量
                 if traffic_ctx.options.traffic_enable_storage() {
                     // 加载 ring 文件中的设备
@@ -222,9 +229,14 @@ impl ModuleType {
                     if !baselines_with_ts.is_empty() {
                         let mut restored_count = 0;
 
+                        let interface_mac = traffic_ctx.device_manager.get_interface_mac();
+                        let exclude_iface = traffic_ctx.options.traffic_exclude_iface_device();
                         for (mac, (ts_ms, wan_rx_bytes, wan_tx_bytes, lan_rx_bytes, lan_tx_bytes, last_online_ts)) in
                             baselines_with_ts.iter()
                         {
+                            if exclude_iface && *mac == interface_mac {
+                                continue;
+                            }
                             if let Err(e) = traffic_ctx.device_manager.update_device_traffic_stats(mac, |stats| {
                                 // 恢复WAN和LAN流量字节数作为基线
                                 stats.wan_rx_bytes = *wan_rx_bytes;
@@ -301,9 +313,12 @@ impl ModuleType {
                     Arc::clone(&traffic_ctx.rate_limit_whitelist),
                     Arc::clone(&traffic_ctx.rate_limit_whitelist_enabled),
                     Arc::clone(&traffic_ctx.default_wan_rate_limits),
+                    Arc::clone(&traffic_ctx.traffic_quota_manager),
                     Arc::clone(&traffic_ctx.realtime_manager),
                     Arc::clone(&traffic_ctx.long_term_manager),
                     Arc::clone(&traffic_ctx.device_manager),
+                    traffic_ctx.ingress_ebpf.as_ref().map(Arc::clone),
+                    Arc::clone(&traffic_ctx.last_ebpf_traffic),
                     traffic_ctx.options.clone(),
                 ));
 

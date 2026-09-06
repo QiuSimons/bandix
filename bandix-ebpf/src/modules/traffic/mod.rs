@@ -3,15 +3,16 @@
 
 pub mod maps;
 
+use core::intrinsics::{atomic_xadd, AtomicOrdering};
 use aya_ebpf::{
-    bindings::{TC_ACT_PIPE, TC_ACT_SHOT},
+    bindings::{TC_ACT_SHOT, TC_ACT_UNSPEC},
     programs::TcContext,
 };
 use network_types::eth::EthHdr;
 use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
 
 use crate::utils::{get_current_time, is_subnet_ip, is_subnet_ipv6, min, ptr_at, subnet::IPV4_SUBNET_INFO};
-use maps::{MAC_RATE_LIMITS, MAC_TRAFFIC, RATE_BUCKETS};
+use maps::{MAC_QUOTA_BLOCKED, MAC_QUOTA_THRESHOLDS, MAC_RATE_LIMITS, MAC_TRAFFIC, RATE_BUCKETS};
 
 // ============================================================================
 // Public Entry Points
@@ -25,7 +26,7 @@ pub fn handle_traffic_ingress(ctx: &TcContext) -> Result<i32, ()> {
     match ethhdr_type {
         network_types::eth::EtherType::Ipv4 => handle_ipv4(ctx, true),
         network_types::eth::EtherType::Ipv6 => handle_ipv6(ctx, true),
-        _ => Ok(TC_ACT_PIPE),
+        _ => Ok(TC_ACT_UNSPEC),
     }
 }
 
@@ -37,7 +38,7 @@ pub fn handle_traffic_egress(ctx: &TcContext) -> Result<i32, ()> {
     match ethhdr_type {
         network_types::eth::EtherType::Ipv4 => handle_ipv4(ctx, false),
         network_types::eth::EtherType::Ipv6 => handle_ipv6(ctx, false),
-        _ => Ok(TC_ACT_PIPE),
+        _ => Ok(TC_ACT_UNSPEC),
     }
 }
 
@@ -61,7 +62,7 @@ fn handle_ipv4(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
 
     // Check subnet configuration
     if !is_subnet_configured() {
-        return Ok(TC_ACT_PIPE);
+        return Ok(TC_ACT_UNSPEC);
     }
 
     // 检查是否addresses are in local subnet
@@ -72,6 +73,9 @@ fn handle_ipv4(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
     if is_ingress {
         // Ingress: throttle upload traffic (local -> external)
         if src_is_local && !dst_is_local {
+            if should_block_quota(&src_mac) {
+                return Ok(TC_ACT_SHOT);
+            }
             let limits = get_rate_limits(&src_mac);
             if limits.1 > 0 {
                 // Check upload limit
@@ -83,6 +87,9 @@ fn handle_ipv4(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
     } else {
         // Egress: throttle download traffic (external -> local)
         if dst_is_local && !src_is_local {
+            if should_block_quota(&dst_mac) {
+                return Ok(TC_ACT_SHOT);
+            }
             let limits = get_rate_limits(&dst_mac);
             if limits.0 > 0 {
                 // Check download limit
@@ -96,7 +103,7 @@ fn handle_ipv4(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
     // Monitor traffic stats
     monitor_traffic(&src_mac, &dst_mac, data_len, &src_ip, &dst_ip);
 
-    Ok(TC_ACT_PIPE)
+    Ok(TC_ACT_UNSPEC)
 }
 
 #[inline(always)]
@@ -141,6 +148,9 @@ fn handle_ipv6(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
     if is_ingress {
         // Ingress: throttle upload traffic (local -> external)
         if src_is_local && !dst_is_local {
+            if should_block_quota(&src_mac) {
+                return Ok(TC_ACT_SHOT);
+            }
             let limits = get_rate_limits(&src_mac);
             if limits.1 > 0 {
                 // Check upload limit
@@ -152,6 +162,9 @@ fn handle_ipv6(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
     } else {
         // Egress: throttle download traffic (external -> local)
         if dst_is_local && !src_is_local {
+            if should_block_quota(&dst_mac) {
+                return Ok(TC_ACT_SHOT);
+            }
             let limits = get_rate_limits(&dst_mac);
             if limits.0 > 0 {
                 // Check download limit
@@ -165,7 +178,7 @@ fn handle_ipv6(ctx: &TcContext, is_ingress: bool) -> Result<i32, ()> {
     // Monitor traffic stats
     monitor_traffic_v6(&src_mac, &dst_mac, data_len, &src_ip, &dst_ip);
 
-    Ok(TC_ACT_PIPE)
+    Ok(TC_ACT_UNSPEC)
 }
 
 // ============================================================================
@@ -181,18 +194,18 @@ fn update_traffic_stats(mac: &[u8; 6], data_len: u64, is_rx: bool, is_local: boo
             if is_local {
                 if is_rx {
                     // lan  receive bytes
-                    (*t)[1] = (*t)[1] + data_len;
+                    atomic_add_u64(&mut (*t)[1], data_len);
                 } else {
                     // lan  send bytes
-                    (*t)[0] = (*t)[0] + data_len;
+                    atomic_add_u64(&mut (*t)[0], data_len);
                 }
             } else {
                 if is_rx {
                     // wan  receive bytes
-                    (*t)[3] = (*t)[3] + data_len;
+                    atomic_add_u64(&mut (*t)[3], data_len);
                 } else {
                     // wan  send bytes
-                    (*t)[2] = (*t)[2] + data_len;
+                    atomic_add_u64(&mut (*t)[2], data_len);
                 }
             }
         },
@@ -214,6 +227,16 @@ fn update_traffic_stats(mac: &[u8; 6], data_len: u64, is_rx: bool, is_local: boo
             let _ = MAC_TRAFFIC.insert(mac, &stats, 0);
         }
     }
+}
+
+#[inline(always)]
+unsafe fn atomic_add_u64(value: *mut u64, amount: u64) {
+    atomic_xadd::<u64, u64, { AtomicOrdering::Relaxed }>(value, amount);
+}
+
+#[inline(always)]
+unsafe fn atomic_load_u64(value: *const u64) -> u64 {
+    core::ptr::read_volatile(value)
 }
 
 #[inline]
@@ -328,4 +351,50 @@ fn get_rate_limits(mac: &[u8; 6]) -> (u64, u64) {
             None => (0, 0),
         }
     }
+}
+
+#[inline]
+fn is_quota_blocked(mac: &[u8; 6]) -> bool {
+    unsafe {
+        match MAC_QUOTA_BLOCKED.get(mac) {
+            Some(value) => *value != 0,
+            None => false,
+        }
+    }
+}
+
+#[inline(always)]
+fn should_block_quota(mac: &[u8; 6]) -> bool {
+    if is_quota_blocked(mac) {
+        return true;
+    }
+
+    let thresholds = unsafe {
+        match MAC_QUOTA_THRESHOLDS.get(mac) {
+            Some(value) => value,
+            None => return false,
+        }
+    };
+    let wan_total = match MAC_TRAFFIC.get_ptr(mac) {
+        Some(stats) => unsafe {
+            atomic_load_u64(&(*stats)[2])
+                .saturating_add(atomic_load_u64(&(*stats)[3]))
+        },
+        None => 0,
+    };
+    let reached = threshold_reached(thresholds[0], wan_total)
+        || threshold_reached(thresholds[1], wan_total)
+        || threshold_reached(thresholds[2], wan_total)
+        || threshold_reached(thresholds[3], wan_total)
+        || threshold_reached(thresholds[4], wan_total)
+        || threshold_reached(thresholds[5], wan_total);
+    if reached {
+        let _ = MAC_QUOTA_BLOCKED.insert(mac, &1u8, 0);
+    }
+    reached
+}
+
+#[inline(always)]
+fn threshold_reached(threshold: u64, wan_total: u64) -> bool {
+    threshold != u64::MAX && wan_total >= threshold
 }

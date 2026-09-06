@@ -1,5 +1,6 @@
 use super::{ApiResponse, HttpRequest, HttpResponse};
 use crate::command::Options;
+use crate::storage::quota::{TrafficQuota, TrafficQuotaManager, TrafficQuotaStatus};
 use crate::storage::traffic::{self, LongTermRingManager, RealtimeRingManager, ScheduledRateLimit, TimeSlot, save_all_scheduled_limits};
 use crate::utils::format_utils::{format_bytes, format_mac};
 use chrono::{DateTime, Utc};
@@ -13,36 +14,60 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 设备信息，用于 API 响应
 #[derive(Serialize, Deserialize)]
 pub struct DeviceInfo {
+    #[serde(rename = "ip4")]
     pub ip: String,
+    #[serde(rename = "ip6")]
     pub ipv6_addresses: Vec<String>,
     pub mac: String,
+    #[serde(rename = "host")]
     pub hostname: String,
+    #[serde(rename = "conn")]
     pub connection_type: String,
+    #[serde(rename = "uplink")]
+    pub uplink: String,
+    #[serde(rename = "w_ch")]
+    pub wifi_channel: u32,
 
+    #[serde(rename = "t_rx_b")]
     pub total_rx_bytes: u64,
+    #[serde(rename = "t_tx_b")]
     pub total_tx_bytes: u64,
+    #[serde(rename = "t_rx_r")]
     pub total_rx_rate: u64,
+    #[serde(rename = "t_tx_r")]
     pub total_tx_rate: u64,
 
+    #[serde(rename = "w_rx_l")]
     pub wan_rx_rate_limit: u64,
+    #[serde(rename = "w_tx_l")]
     pub wan_tx_rate_limit: u64,
 
+    #[serde(rename = "l_rx_b")]
     pub lan_rx_bytes: u64,
+    #[serde(rename = "l_tx_b")]
     pub lan_tx_bytes: u64,
+    #[serde(rename = "l_rx_r")]
     pub lan_rx_rate: u64,
+    #[serde(rename = "l_tx_r")]
     pub lan_tx_rate: u64,
 
+    #[serde(rename = "w_rx_b")]
     pub wan_rx_bytes: u64,
+    #[serde(rename = "w_tx_b")]
     pub wan_tx_bytes: u64,
+    #[serde(rename = "w_rx_r")]
     pub wan_rx_rate: u64,
+    #[serde(rename = "w_tx_r")]
     pub wan_tx_rate: u64,
 
+    #[serde(rename = "last")]
     pub last_online_ts: u64,
 }
 
 /// 设备响应结构
 #[derive(Serialize, Deserialize)]
 pub struct DevicesResponse {
+    #[serde(rename = "d")]
     pub devices: Vec<DeviceInfo>,
 }
 
@@ -62,75 +87,128 @@ pub struct MetricsResponse {
 #[derive(Serialize, Deserialize)]
 pub struct DeviceUsageRanking {
     pub mac: String,
+    #[serde(rename = "host")]
     pub hostname: String,
+    #[serde(rename = "ip4")]
     pub ip: String,
-    pub total_bytes: u64, // 时间范围内总字节数（rx + tx）
-    pub rx_bytes: u64,    // 接收字节数
-    pub tx_bytes: u64,    // 发送字节数
-    pub percentage: f64,  // 总使用量的百分比
-    pub rank: usize,      // 排名位置（从1开始）
+    #[serde(rename = "t_b")]
+    pub total_bytes: u64,
+    #[serde(rename = "rx_b")]
+    pub rx_bytes: u64,
+    #[serde(rename = "tx_b")]
+    pub tx_bytes: u64,
+    #[serde(rename = "pct")]
+    pub percentage: f64,
+    #[serde(rename = "r")]
+    pub rank: usize,
 }
 
 /// 设备使用排名响应结构
 #[derive(Serialize, Deserialize)]
 pub struct DeviceUsageRankingResponse {
+    #[serde(rename = "start")]
     pub start_ms: u64,
+    #[serde(rename = "end")]
     pub end_ms: u64,
-    pub network_type: String, // "wan", "lan", 或 "all"
-    pub total_bytes: u64,     // 所有设备的总字节数
-    pub total_rx_bytes: u64,  // 所有设备的总接收字节数
-    pub total_tx_bytes: u64,  // 所有设备的总发送字节数
-    pub device_count: usize,  // 设备数量
+    #[serde(rename = "net")]
+    pub network_type: String,
+    #[serde(rename = "t_b")]
+    pub total_bytes: u64,
+    #[serde(rename = "t_rx_b")]
+    pub total_rx_bytes: u64,
+    #[serde(rename = "t_tx_b")]
+    pub total_tx_bytes: u64,
+    #[serde(rename = "cnt")]
+    pub device_count: usize,
+    #[serde(rename = "r")]
     pub rankings: Vec<DeviceUsageRanking>,
 }
 
 /// 时间序列增量条目（每小时或每日）
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TimeSeriesIncrement {
+    #[serde(rename = "start")]
     pub start_ts_ms: u64,
+    #[serde(rename = "end")]
     pub end_ts_ms: u64,
+    #[serde(rename = "w_rx_avg")]
     pub wan_rx_rate_avg: u64,
+    #[serde(rename = "w_rx_max")]
     pub wan_rx_rate_max: u64,
+    #[serde(rename = "w_rx_min")]
     pub wan_rx_rate_min: u64,
+    #[serde(rename = "w_rx_p90")]
     pub wan_rx_rate_p90: u64,
+    #[serde(rename = "w_rx_p95")]
     pub wan_rx_rate_p95: u64,
+    #[serde(rename = "w_rx_p99")]
     pub wan_rx_rate_p99: u64,
+    #[serde(rename = "w_tx_avg")]
     pub wan_tx_rate_avg: u64,
+    #[serde(rename = "w_tx_max")]
     pub wan_tx_rate_max: u64,
+    #[serde(rename = "w_tx_min")]
     pub wan_tx_rate_min: u64,
+    #[serde(rename = "w_tx_p90")]
     pub wan_tx_rate_p90: u64,
+    #[serde(rename = "w_tx_p95")]
     pub wan_tx_rate_p95: u64,
+    #[serde(rename = "w_tx_p99")]
     pub wan_tx_rate_p99: u64,
+    #[serde(rename = "w_rx_b")]
     pub wan_rx_bytes_inc: u64,
+    #[serde(rename = "w_tx_b")]
     pub wan_tx_bytes_inc: u64,
+    #[serde(rename = "l_rx_avg")]
     pub lan_rx_rate_avg: u64,
+    #[serde(rename = "l_rx_max")]
     pub lan_rx_rate_max: u64,
+    #[serde(rename = "l_rx_min")]
     pub lan_rx_rate_min: u64,
+    #[serde(rename = "l_rx_p90")]
     pub lan_rx_rate_p90: u64,
+    #[serde(rename = "l_rx_p95")]
     pub lan_rx_rate_p95: u64,
+    #[serde(rename = "l_rx_p99")]
     pub lan_rx_rate_p99: u64,
+    #[serde(rename = "l_tx_avg")]
     pub lan_tx_rate_avg: u64,
+    #[serde(rename = "l_tx_max")]
     pub lan_tx_rate_max: u64,
+    #[serde(rename = "l_tx_min")]
     pub lan_tx_rate_min: u64,
+    #[serde(rename = "l_tx_p90")]
     pub lan_tx_rate_p90: u64,
+    #[serde(rename = "l_tx_p95")]
     pub lan_tx_rate_p95: u64,
+    #[serde(rename = "l_tx_p99")]
     pub lan_tx_rate_p99: u64,
+    #[serde(rename = "l_rx_b")]
     pub lan_rx_bytes_inc: u64,
+    #[serde(rename = "l_tx_b")]
     pub lan_tx_bytes_inc: u64,
 }
 
 /// 时间序列增量响应结构
 #[derive(Serialize, Deserialize)]
 pub struct TimeSeriesIncrementResponse {
+    #[serde(rename = "start")]
     pub start_ms: u64,
+    #[serde(rename = "end")]
     pub end_ms: u64,
-    pub aggregation: String,  // "hourly" 或 "daily"
-    pub mac: String,          // MAC 地址（或 "all" 表示聚合）
-    pub network_type: String, // "wan" 或 "lan"
+    #[serde(rename = "agg")]
+    pub aggregation: String,
+    pub mac: String,
+    #[serde(rename = "net")]
+    pub network_type: String,
+    #[serde(rename = "inc")]
     pub increments: Vec<TimeSeriesIncrement>,
-    pub total_rx_bytes: u64, // 范围内的总 RX 字节数
-    pub total_tx_bytes: u64, // 范围内的总 TX 字节数
-    pub total_bytes: u64,    // 范围内的总字节数
+    #[serde(rename = "t_rx_b")]
+    pub total_rx_bytes: u64,
+    #[serde(rename = "t_tx_b")]
+    pub total_tx_bytes: u64,
+    #[serde(rename = "t_b")]
+    pub total_bytes: u64,
 }
 
 /// 主机名绑定信息，用于 API 响应
@@ -241,7 +319,35 @@ pub struct DeleteScheduledLimitRequest {
     pub id: String,
 }
 
-/// 流量 monitoring API handler
+#[derive(Serialize, Deserialize)]
+pub struct DeleteDeviceRequest {
+    pub mac: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetTrafficQuotaRequest {
+    pub mac: String,
+    /// Bytes allowed in the local minute/calendar periods. 0 = unlimited.
+    #[serde(default)]
+    pub minute_bytes: u64,
+    pub hourly_bytes: u64,
+    pub daily_bytes: u64,
+    pub weekly_bytes: u64,
+    pub monthly_bytes: u64,
+    /// Lifetime bytes since this device quota was first created. 0 = unlimited.
+    pub total_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteTrafficQuotaRequest {
+    pub mac: String,
+}
+
+#[derive(Serialize)]
+pub struct TrafficQuotasResponse {
+    pub quotas: Vec<TrafficQuotaStatus>,
+}
+
 #[derive(Clone)]
 pub struct TrafficApiHandler {
     scheduled_rate_limits: Arc<Mutex<Vec<ScheduledRateLimit>>>,
@@ -249,9 +355,12 @@ pub struct TrafficApiHandler {
     rate_limit_whitelist: Arc<Mutex<HashSet<[u8; 6]>>>,
     rate_limit_whitelist_enabled: Arc<AtomicBool>,
     default_wan_rate_limits: Arc<Mutex<[u64; 2]>>,
+    traffic_quota_manager: Arc<Mutex<TrafficQuotaManager>>,
     realtime_manager: Arc<RealtimeRingManager>,
     long_term_manager: Arc<LongTermRingManager>,
     device_manager: Arc<crate::device::DeviceManager>,
+    ingress_ebpf: Option<std::sync::Arc<aya::Ebpf>>,
+    last_ebpf_traffic: Arc<Mutex<std::collections::HashMap<[u8; 6], [u64; 4]>>>,
     options: Options,
 }
 
@@ -262,9 +371,12 @@ impl TrafficApiHandler {
         rate_limit_whitelist: Arc<Mutex<HashSet<[u8; 6]>>>,
         rate_limit_whitelist_enabled: Arc<AtomicBool>,
         default_wan_rate_limits: Arc<Mutex<[u64; 2]>>,
+        traffic_quota_manager: Arc<Mutex<TrafficQuotaManager>>,
         realtime_manager: Arc<RealtimeRingManager>,
         long_term_manager: Arc<LongTermRingManager>,
         device_manager: Arc<crate::device::DeviceManager>,
+        ingress_ebpf: Option<std::sync::Arc<aya::Ebpf>>,
+        last_ebpf_traffic: Arc<Mutex<std::collections::HashMap<[u8; 6], [u64; 4]>>>,
         options: Options,
     ) -> Self {
         Self {
@@ -273,9 +385,12 @@ impl TrafficApiHandler {
             rate_limit_whitelist,
             rate_limit_whitelist_enabled,
             default_wan_rate_limits,
+            traffic_quota_manager,
             realtime_manager,
             long_term_manager,
             device_manager,
+            ingress_ebpf,
+            last_ebpf_traffic,
             options,
         }
     }
@@ -293,18 +408,18 @@ impl TrafficApiHandler {
             "/api/traffic/rate_limit/whitelist",
             "/api/traffic/rate_limit/whitelist/enabled",
             "/api/traffic/rate_limit/default",
+            "/api/traffic/quotas",
+            "/api/traffic/persist",
         ]
     }
 
     pub async fn handle_request(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
         match request.path.as_str() {
-            "/api/traffic/devices" => {
-                if request.method == "GET" {
-                    self.handle_devices(request).await
-                } else {
-                    Ok(HttpResponse::error(405, "Method not allowed".to_string()))
-                }
-            }
+            "/api/traffic/devices" => match request.method.as_str() {
+                "GET" => self.handle_devices(request).await,
+                "DELETE" => self.handle_delete_device(request).await,
+                _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
+            },
             "/api/traffic/bindings" => match request.method.as_str() {
                 "GET" => self.handle_hostname_bindings().await,
                 "POST" => self.handle_set_hostname_binding(request).await,
@@ -351,6 +466,16 @@ impl TrafficApiHandler {
             },
             "/api/traffic/rate_limit/default" => match request.method.as_str() {
                 "POST" => self.handle_rate_limit_set_default_limits(request).await,
+                _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
+            },
+            "/api/traffic/quotas" => match request.method.as_str() {
+                "GET" => self.handle_traffic_quotas_get().await,
+                "POST" | "PUT" => self.handle_traffic_quota_set(request).await,
+                "DELETE" => self.handle_traffic_quota_delete(request).await,
+                _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
+            },
+            "/api/traffic/persist" => match request.method.as_str() {
+                "POST" => self.handle_persist().await,
                 _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
             },
             _ => Ok(HttpResponse::not_found()),
@@ -477,6 +602,62 @@ impl TrafficApiHandler {
         let body = serde_json::to_string(&api_response)?;
         Ok(HttpResponse::ok(body))
     }
+
+    async fn handle_persist(&self) -> Result<HttpResponse, anyhow::Error> {
+        if !self.options.traffic_enable_storage() {
+            return Ok(HttpResponse::error(
+                400,
+                "Traffic storage is not enabled (use --traffic-enable-storage)".to_string(),
+            ));
+        }
+        self.long_term_manager.flush_dirty_rings().await?;
+        self.traffic_quota_manager.lock().unwrap().save()?;
+        let api_response = ApiResponse::success(());
+        let body = serde_json::to_string(&api_response)?;
+        Ok(HttpResponse::ok(body))
+    }
+
+    async fn handle_traffic_quotas_get(&self) -> Result<HttpResponse, anyhow::Error> {
+        let quotas = self.traffic_quota_manager.lock().unwrap().statuses(&chrono::Local::now());
+        let response = ApiResponse::success(TrafficQuotasResponse { quotas });
+        Ok(HttpResponse::ok(serde_json::to_string(&response)?))
+    }
+
+    async fn handle_traffic_quota_set(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+        let body = request.body.as_ref().ok_or_else(|| anyhow::anyhow!("Missing request body"))?;
+        let req: SetTrafficQuotaRequest = serde_json::from_str(body)?;
+        let mac = crate::utils::network_utils::parse_mac_address(&req.mac)?;
+        let mut manager = self.traffic_quota_manager.lock().unwrap();
+        manager.set_quota(
+            mac,
+            TrafficQuota {
+                minute_bytes: req.minute_bytes,
+                hourly_bytes: req.hourly_bytes,
+                daily_bytes: req.daily_bytes,
+                weekly_bytes: req.weekly_bytes,
+                monthly_bytes: req.monthly_bytes,
+                total_bytes: req.total_bytes,
+            },
+            &chrono::Local::now(),
+        );
+        manager.save()?;
+        let status = manager.status(&mac, &chrono::Local::now()).unwrap();
+        let response = ApiResponse::success(status);
+        Ok(HttpResponse::ok(serde_json::to_string(&response)?))
+    }
+
+    async fn handle_traffic_quota_delete(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+        let body = request.body.as_ref().ok_or_else(|| anyhow::anyhow!("Missing request body"))?;
+        let req: DeleteTrafficQuotaRequest = serde_json::from_str(body)?;
+        let mac = crate::utils::network_utils::parse_mac_address(&req.mac)?;
+        let mut manager = self.traffic_quota_manager.lock().unwrap();
+        if !manager.remove_quota(&mac) {
+            return Ok(HttpResponse::error(404, "Traffic quota not found".to_string()));
+        }
+        manager.save()?;
+        let response = ApiResponse::success(());
+        Ok(HttpResponse::ok(serde_json::to_string(&response)?))
+    }
 }
 
 impl TrafficApiHandler {
@@ -517,9 +698,8 @@ impl TrafficApiHandler {
         let current_hour_end = current_hour_start + (3600 * 1000);
 
         let bindings_map = self.hostname_bindings.lock().unwrap();
-        let wifi_set = self.device_manager.get_wifi_macs_snapshot();
-        let wired_set = self.device_manager.get_wired_macs_snapshot();
-        let interface_mac = self.device_manager.get_interface_mac();
+        let bridge_port_map = self.device_manager.get_bridge_port_map_snapshot();
+        let wifi_channel_map = self.device_manager.get_wifi_channel_map_snapshot();
 
         // 从设备管理器收集所有设备（包括在线和离线设备）
         let all_devices = self.device_manager.get_all_devices_with_mac();
@@ -554,14 +734,13 @@ impl TrafficApiHandler {
                     bindings_map.get(&mac).cloned().unwrap_or_default()
                 };
 
-                let connection_type = if mac == interface_mac {
-                    "router".to_string()
-                } else if wifi_set.contains(&mac) {
-                    "wifi".to_string()
-                } else if wired_set.contains(&mac) {
-                    "wired".to_string()
+                let connection_type = self.device_manager.resolve_connection_type(&mac);
+
+                let uplink = bridge_port_map.get(&mac).cloned().unwrap_or_default();
+                let wifi_channel = if connection_type == "wifi" {
+                    wifi_channel_map.get(&uplink).copied().unwrap_or(0)
                 } else {
-                    "".to_string()
+                    0
                 };
 
                 // 计算指定时间段的流量
@@ -672,6 +851,8 @@ impl TrafficApiHandler {
                     mac: mac_str,
                     hostname,
                     connection_type,
+                    uplink,
+                    wifi_channel,
                     total_rx_bytes: final_total_rx_bytes,
                     total_tx_bytes: final_total_tx_bytes,
                     total_rx_rate: device.total_rx_rate(),
@@ -719,7 +900,88 @@ impl TrafficApiHandler {
         Ok(HttpResponse::ok(body))
     }
 
-    /// 处理/api/traffic/metrics endpoint - 实时指标（仅内存，未持久化）
+    async fn handle_delete_device(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+        let body = request.body.as_ref().ok_or_else(|| anyhow::anyhow!("Missing request body"))?;
+        let req: DeleteDeviceRequest = serde_json::from_str(body)?;
+        let mac = crate::utils::network_utils::parse_mac_address(&req.mac)?;
+
+        if !self.device_manager.remove_device(&mac) {
+            return Ok(HttpResponse::error(404, "Device not found".to_string()));
+        }
+
+        self.realtime_manager.remove_device(&mac);
+        self.long_term_manager.remove_device(&mac)?;
+
+        {
+            let mut bindings = self.hostname_bindings.lock().unwrap();
+            bindings.remove(&mac);
+        }
+        traffic::upsert_hostname_binding(self.options.data_dir(), &mac, "")?;
+
+        {
+            let mut wl = self.rate_limit_whitelist.lock().unwrap();
+            wl.remove(&mac);
+        }
+        let enabled = self.rate_limit_whitelist_enabled.load(Ordering::Relaxed);
+        let default_limits = *self.default_wan_rate_limits.lock().unwrap();
+        let wl = self.rate_limit_whitelist.lock().unwrap().clone();
+        let policy = traffic::RateLimitPolicy {
+            enabled,
+            default_wan_limits: default_limits,
+            whitelist: wl,
+        };
+        traffic::save_rate_limit_policy(self.options.data_dir(), &policy)?;
+
+        {
+            let mut srl = self.scheduled_rate_limits.lock().unwrap();
+            srl.retain(|r| r.mac != mac);
+        }
+        traffic::delete_scheduled_limits_by_mac(self.options.data_dir(), &mac)?;
+
+        {
+            let mut quotas = self.traffic_quota_manager.lock().unwrap();
+            if quotas.remove_quota(&mac) {
+                quotas.save()?;
+            }
+        }
+
+        {
+            let mut last_ebpf = self.last_ebpf_traffic.lock().unwrap();
+            last_ebpf.remove(&mac);
+        }
+
+        if let Some(ingress_ebpf) = self.ingress_ebpf.as_ref() {
+            let ebpf_mut = unsafe {
+                let ptr = std::sync::Arc::as_ptr(ingress_ebpf) as *const aya::Ebpf as *mut aya::Ebpf;
+                &mut *ptr
+            };
+            if let Ok(mut mac_traffic) = aya::maps::HashMap::<_, [u8; 6], [u64; 4]>::try_from(ebpf_mut.map_mut("MAC_TRAFFIC").ok_or_else(|| anyhow::anyhow!("MAC_TRAFFIC map not found"))?) {
+                let _ = mac_traffic.remove(&mac);
+            }
+            if let Ok(mut mac_rate_limits) = aya::maps::HashMap::<_, [u8; 6], [u64; 2]>::try_from(ebpf_mut.map_mut("MAC_RATE_LIMITS").ok_or_else(|| anyhow::anyhow!("MAC_RATE_LIMITS map not found"))?) {
+                let _ = mac_rate_limits.remove(&mac);
+            }
+            if let Ok(mut rate_buckets) = aya::maps::HashMap::<_, [u8; 6], [u64; 3]>::try_from(ebpf_mut.map_mut("RATE_BUCKETS").ok_or_else(|| anyhow::anyhow!("RATE_BUCKETS map not found"))?) {
+                let _ = rate_buckets.remove(&mac);
+            }
+            if let Ok(mut quota_blocked) = aya::maps::HashMap::<_, [u8; 6], u8>::try_from(ebpf_mut.map_mut("MAC_QUOTA_BLOCKED").ok_or_else(|| anyhow::anyhow!("MAC_QUOTA_BLOCKED map not found"))?) {
+                let _ = quota_blocked.remove(&mac);
+            }
+            if let Ok(mut quota_thresholds) = aya::maps::HashMap::<_, [u8; 6], [u64; 6]>::try_from(
+                ebpf_mut
+                    .map_mut("MAC_QUOTA_THRESHOLDS")
+                    .ok_or_else(|| anyhow::anyhow!("MAC_QUOTA_THRESHOLDS map not found"))?,
+            ) {
+                let _ = quota_thresholds.remove(&mac);
+            }
+        }
+
+        log::info!("Device deleted: {}", format_mac(&mac));
+        let api_response = ApiResponse::success(());
+        let body = serde_json::to_string(&api_response)?;
+        Ok(HttpResponse::ok(body))
+    }
+
     async fn handle_metrics(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
         let mac_opt = request.query_params.get("mac").cloned();
 

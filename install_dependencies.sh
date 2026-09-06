@@ -4,9 +4,18 @@
 
 set -e
 
-INSTALL_BASE="/opt/musl-cross"
+INSTALL_BASE="${HOME}/musl-cross"
 MUSL_CC_BASE="https://github.com/timsaya/musl-cc/releases/download/v0.1.0/"
 PACKAGE_MANAGER=""
+
+# 安装系统包时需 root：已是 root 则直接执行，否则用 sudo
+root_exec() {
+    if [ "${EUID:-0}" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
 
 # 颜色输出
 RED='\033[0;31m'
@@ -36,10 +45,10 @@ declare -A TOOLCHAINS=(
 detect_package_manager() {
     if command -v apt-get &> /dev/null; then
         PACKAGE_MANAGER="apt"
-    elif command -v yum &> /dev/null; then
-        PACKAGE_MANAGER="yum"
     elif command -v dnf &> /dev/null; then
         PACKAGE_MANAGER="dnf"
+    elif command -v yum &> /dev/null; then
+        PACKAGE_MANAGER="yum"
     elif command -v pacman &> /dev/null; then
         PACKAGE_MANAGER="pacman"
     else
@@ -50,22 +59,14 @@ detect_package_manager() {
 install_system_packages() {
     case "$PACKAGE_MANAGER" in
         apt)
-            apt-get update
-            apt-get install -y build-essential curl tar gzip xz-utils pkg-config gcc file musl-tools
+            root_exec apt-get update
+            root_exec apt-get install -y build-essential curl tar gzip xz-utils pkg-config gcc file wget
             ;;
-        yum)
-            yum groupinstall -y "Development Tools"
-            yum install -y curl tar gzip xz pkgconfig gcc file musl-gcc musl-libc-static
-            ;;
-        dnf)
-            dnf groupinstall -y 'Development Tools'
-            dnf install -y curl tar gzip xz pkg-config gcc file musl-gcc musl-libc-static
-            ;;
-        pacman)
-            pacman -Sy --noconfirm base-devel curl tar gzip xz pkgconf gcc file musl
+        dnf|yum)
+            root_exec "$PACKAGE_MANAGER" install -y gcc gcc-c++ make curl tar gzip xz pkgconf-pkg-config file wget
             ;;
         *)
-            echo -e "${RED}错误: 未能识别的包管理器，请手动安装 gcc、make、curl、tar、gzip、xz、pkg-config、musl-tools${NC}"
+            echo -e "${RED}错误: 未能识别的包管理器，仅支持 apt (Debian/Ubuntu) 或 dnf/yum (Fedora/RHEL 等)"
             exit 1
             ;;
     esac
@@ -78,14 +79,13 @@ install_system_packages
 
 # 创建安装目录
 mkdir -p "$INSTALL_BASE"
-chown "$(whoami)":"$(whoami)" "$INSTALL_BASE" 2>/dev/null || true
 
 # 安装 Rust 工具链
 echo ""
 echo -e "${YELLOW}[2/4] 安装 Rust 工具链...${NC}"
 if ! command -v rustup &> /dev/null; then
     echo "安装 rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 fi
 
 if [ -f "$HOME/.cargo/env" ]; then
@@ -94,17 +94,20 @@ if [ -f "$HOME/.cargo/env" ]; then
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
-echo "安装/更新 stable 工具链..."
-rustup toolchain install stable || true
+echo "安装 Rust 1.91.1 工具链..."
+rustup toolchain install 1.91.1-x86_64-unknown-linux-gnu
+
+echo "设置默认工具链为 1.91.1..."
+rustup default 1.91.1-x86_64-unknown-linux-gnu
 
 echo "安装/更新 nightly 工具链..."
 rustup toolchain install nightly
 
 echo "添加 rust-src 组件 (nightly)..."
-rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu || {
-    echo -e "${RED}安装 rust-src 失败，请检查 rustup 输出${NC}"
-    exit 1
-}
+rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+
+echo "安装 bpf-linker (v0.10.2) ..." # bpf-linker 版本需要和 LLVM 版本对应 。  v0.10.2 对应 LLVM 21.1.2
+cargo install bpf-linker@0.10.2
 
 RUST_TARGETS=(
     "x86_64-unknown-linux-musl"
