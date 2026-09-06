@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(core_intrinsics)]
 
 mod modules;
 mod utils;

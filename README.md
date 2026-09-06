@@ -14,6 +14,7 @@ Bandix is a network traffic monitoring tool based on eBPF technology, developed 
 - **Connection Statistics**: Monitor TCP/UDP connections per device with state tracking
 - **MAC Address Recognition**: Automatically associates IP addresses with MAC addresses
 - **Scheduled Rate Limiting**: Set time-based rate limits for devices with flexible scheduling
+- **Traffic Quotas**: Set per-minute, hourly, daily, weekly, monthly, and lifetime WAN usage limits per device
 - **Hostname Bindings**: Custom device hostname mapping for better device identification
 - **High Performance**: Uses Rust and eBPF to ensure minimal impact on system performance during monitoring
 
@@ -184,6 +185,38 @@ Delete a scheduled rate limit.
     "end": "18:00",
     "days": [1, 2, 3, 4, 5]
   }
+}
+```
+
+#### GET /api/traffic/quotas
+
+Returns every device quota, current usage, exceeded periods, and blocking state. Usage is WAN download plus upload. Minute/hour/day/week/month periods follow the router's local calendar (weeks start on Monday); lifetime usage never resets automatically.
+
+#### POST /api/traffic/quotas
+
+Creates or updates a device quota. All values are bytes and `0` means unlimited for that period. Usage begins when the quota is first created and is retained when limits are updated. `PUT` accepts the same request.
+
+```json
+{
+  "mac": "00:11:22:33:44:55",
+  "minute_bytes": 104857600,
+  "hourly_bytes": 1073741824,
+  "daily_bytes": 5368709120,
+  "weekly_bytes": 21474836480,
+  "monthly_bytes": 53687091200,
+  "total_bytes": 107374182400
+}
+```
+
+Reaching any non-zero limit blocks that device's IPv4 and IPv6 WAN upload and download without affecting LAN traffic. Enforcement uses absolute WAN-byte thresholds in the TC eBPF program, so packets are checked in the kernel rather than waiting for the one-second userspace sampling cycle. The packet that crosses a threshold is allowed; subsequent packets are dropped, limiting normal overshoot to roughly one packet (or a small number of concurrently processed packets).
+
+#### DELETE /api/traffic/quotas
+
+Deletes the device quota and its accumulated usage. The quota block is removed on the next monitoring cycle (normally within one second).
+
+```json
+{
+  "mac": "00:11:22:33:44:55"
 }
 ```
 

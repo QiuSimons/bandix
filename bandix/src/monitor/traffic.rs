@@ -2,6 +2,7 @@ use crate::monitor::TrafficModuleContext;
 use anyhow::Result;
 use aya::maps::HashMap;
 use aya::maps::MapData;
+use chrono::Local;
 use serde::Serialize;
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,9 @@ impl TrafficMonitor {
                             log::error!("Failed to flush long-term rings during shutdown: {}", e);
                         }
                     }
+                    if let Err(e) = ctx.traffic_quota_manager.lock().unwrap().save() {
+                        log::error!("Failed to persist traffic quota state during shutdown: {}", e);
+                    }
                     break;
                 }
             }
@@ -96,12 +100,16 @@ impl TrafficMonitor {
             }
         };
 
-        if let Err(e) = self.process_traffic_data(ctx, &ingress_ebpf).await {
-            log::error!("Failed to process traffic data: {}", e);
-        }
+        let traffic_data = match self.process_traffic_data(ctx, &ingress_ebpf).await {
+            Ok(traffic_data) => Some(traffic_data),
+            Err(e) => {
+                log::error!("Failed to process traffic data: {}", e);
+                None
+            }
+        };
 
         // 检测是否要应用限速规则
-        if let Err(e) = self.apply_rate_limits(ctx, &ingress_ebpf) {
+        if let Err(e) = self.apply_rate_limits(ctx, &ingress_ebpf, traffic_data.as_ref()) {
             log::error!("Failed to update rate limits: {}", e);
         }
 
@@ -118,6 +126,15 @@ impl TrafficMonitor {
 
         if let Err(e) = ctx.long_term_manager.insert_metrics_batch(now_ts_ms, &traffic_snapshot) {
             log::error!("Failed to persist metrics to long-term ring: {}", e);
+        }
+
+        if let Err(e) = ctx
+            .traffic_quota_manager
+            .lock()
+            .unwrap()
+            .persist_if_due(now_ts_ms, ctx.options.traffic_flush_interval())
+        {
+            log::error!("Failed to persist traffic quota state: {}", e);
         }
 
         let export_url = ctx.options.traffic_export_url().trim();
@@ -220,7 +237,11 @@ impl TrafficMonitor {
         Ok(traffic)
     }
 
-    async fn process_traffic_data(&self, ctx: &mut TrafficModuleContext, ebpf: &Arc<aya::Ebpf>) -> Result<(), anyhow::Error> {
+    async fn process_traffic_data(
+        &self,
+        ctx: &mut TrafficModuleContext,
+        ebpf: &Arc<aya::Ebpf>,
+    ) -> Result<StdHashMap<[u8; 6], [u64; 4]>, anyhow::Error> {
         let traffic_data = self.collect_traffic_data(ebpf)?;
 
         // 获取所有已知设备
@@ -256,7 +277,7 @@ impl TrafficMonitor {
         // 处理设备流量数据
         self.process_device_traffic_updates(ctx, &raw_device_traffic, &all_device_macs, &scheduled_limits)?;
 
-        Ok(())
+        Ok(traffic_data)
     }
 
     /// 处理所有设备的流量更新，包括有流量和无流量的设备
@@ -331,6 +352,17 @@ impl TrafficMonitor {
         }) {
             log::warn!("Failed to update device stats for {:?}: {}", mac, e);
         }
+
+        let wan_delta = wan_rx_delta.saturating_add(wan_tx_delta);
+        let mut quota_manager = ctx.traffic_quota_manager.lock().unwrap();
+        if quota_manager.record_usage(mac, wan_delta, &Local::now()) {
+            // Persist an exhausted quota immediately so a restart cannot clear
+            // the block before the normal checkpoint interval.
+            if let Err(e) = quota_manager.save() {
+                log::error!("Failed to persist exhausted traffic quota: {}", e);
+            }
+        }
+        drop(quota_manager);
 
         // 保存当前 eBPF 值用于下次计算
         let mut last_ebpf = ctx.last_ebpf_traffic.lock().unwrap();
@@ -410,11 +442,21 @@ impl TrafficMonitor {
         }
     }
 
-    fn apply_rate_limits(&self, ctx: &mut TrafficModuleContext, _ebpf: &Arc<aya::Ebpf>) -> Result<(), anyhow::Error> {
+    fn apply_rate_limits(
+        &self,
+        ctx: &mut TrafficModuleContext,
+        _ebpf: &Arc<aya::Ebpf>,
+        traffic_data: Option<&StdHashMap<[u8; 6], [u64; 4]>>,
+    ) -> Result<(), anyhow::Error> {
         let scheduled_limits = ctx.scheduled_rate_limits.lock().unwrap();
         let policy_enabled = ctx.rate_limit_whitelist_enabled.load(std::sync::atomic::Ordering::Relaxed);
         let whitelist = ctx.rate_limit_whitelist.lock().unwrap().clone();
         let default_limits = *ctx.default_wan_rate_limits.lock().unwrap();
+        let (quota_blocked, quota_remaining) = {
+            let mut manager = ctx.traffic_quota_manager.lock().unwrap();
+            let now = Local::now();
+            (manager.blocked_macs(&now), manager.enforcement_remaining(&now))
+        };
 
         let device_macs: std::collections::HashSet<[u8; 6]> = ctx
             .device_manager
@@ -477,30 +519,75 @@ impl TrafficMonitor {
             &mut *ptr
         };
 
-        let mut mac_rate_limits: HashMap<_, [u8; 6], [u64; 2]> = HashMap::try_from(
-            ebpf_mut
-                .map_mut("MAC_RATE_LIMITS")
-                .ok_or(anyhow::anyhow!("Cannot find MAC_RATE_LIMITS"))?,
-        )?;
+        {
+            let mut mac_rate_limits: HashMap<_, [u8; 6], [u64; 2]> = HashMap::try_from(
+                ebpf_mut
+                    .map_mut("MAC_RATE_LIMITS")
+                    .ok_or(anyhow::anyhow!("Cannot find MAC_RATE_LIMITS"))?,
+            )?;
 
-        // 收集当前在 eBPF 映射中的所有 MAC
-        let mut existing_macs_in_ebpf: std::collections::HashSet<[u8; 6]> = std::collections::HashSet::new();
-        for entry in mac_rate_limits.iter() {
-            if let Ok((mac, _)) = entry {
-                existing_macs_in_ebpf.insert(mac);
+            // 收集当前在 eBPF 映射中的所有 MAC
+            let mut existing_macs_in_ebpf: std::collections::HashSet<[u8; 6]> = std::collections::HashSet::new();
+            for entry in mac_rate_limits.iter() {
+                if let Ok((mac, _)) = entry {
+                    existing_macs_in_ebpf.insert(mac);
+                }
+            }
+
+            // 将有效限制应用到 eBPF 映射（更新或添加）
+            for (mac, lim) in desired_limits.iter() {
+                mac_rate_limits.insert(mac, &[lim[0], lim[1]], 0).unwrap();
+                existing_macs_in_ebpf.remove(mac);
+            }
+
+            // 清除不再有匹配规则的 MAC 的限制
+            // 设置为 [0, 0] 以移除速率限制（无限制）
+            for mac in existing_macs_in_ebpf.iter() {
+                mac_rate_limits.insert(mac, &[0, 0], 0).unwrap();
             }
         }
 
-        // 将有效限制应用到 eBPF 映射（更新或添加）
-        for (mac, lim) in desired_limits.iter() {
-            mac_rate_limits.insert(mac, &[lim[0], lim[1]], 0).unwrap();
-            existing_macs_in_ebpf.remove(mac);
+        if let Some(traffic_data) = traffic_data {
+            let mut quota_thresholds_map: HashMap<_, [u8; 6], [u64; 6]> = HashMap::try_from(
+                ebpf_mut
+                    .map_mut("MAC_QUOTA_THRESHOLDS")
+                    .ok_or(anyhow::anyhow!("Cannot find MAC_QUOTA_THRESHOLDS"))?,
+            )?;
+            let mut existing_quota_macs = std::collections::HashSet::new();
+            for (mac, _) in quota_thresholds_map.iter().flatten() {
+                existing_quota_macs.insert(mac);
+            }
+
+            for (mac, remaining) in quota_remaining {
+                let wan_total = traffic_data
+                    .get(&mac)
+                    .map(|stats| stats[2].saturating_add(stats[3]))
+                    .unwrap_or(0);
+                let thresholds = build_quota_thresholds(wan_total, remaining);
+                quota_thresholds_map.insert(mac, thresholds, 0)?;
+                existing_quota_macs.remove(&mac);
+            }
+
+            for mac in existing_quota_macs {
+                let _ = quota_thresholds_map.remove(&mac);
+            }
         }
 
-        // 清除不再有匹配规则的 MAC 的限制
-        // 设置为 [0, 0] 以移除速率限制（无限制）
-        for mac in existing_macs_in_ebpf.iter() {
-            mac_rate_limits.insert(mac, &[0, 0], 0).unwrap();
+        let mut quota_blocked_map: HashMap<_, [u8; 6], u8> = HashMap::try_from(
+            ebpf_mut
+                .map_mut("MAC_QUOTA_BLOCKED")
+                .ok_or(anyhow::anyhow!("Cannot find MAC_QUOTA_BLOCKED"))?,
+        )?;
+        let mut existing_blocked = std::collections::HashSet::new();
+        for (mac, _) in quota_blocked_map.iter().flatten() {
+            existing_blocked.insert(mac);
+        }
+        for mac in quota_blocked {
+            quota_blocked_map.insert(mac, 1, 0)?;
+            existing_blocked.remove(&mac);
+        }
+        for mac in existing_blocked {
+            let _ = quota_blocked_map.remove(&mac);
         }
 
         Ok(())
@@ -571,4 +658,27 @@ impl TrafficMonitor {
     }
 
     // events are emitted by DeviceManager background refresh task (neighbor-table based)
+}
+
+fn build_quota_thresholds(wan_total: u64, remaining: [u64; 6]) -> [u64; 6] {
+    remaining.map(|value| {
+        if value == u64::MAX {
+            u64::MAX
+        } else {
+            wan_total.saturating_add(value)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_quota_thresholds;
+
+    #[test]
+    fn quota_thresholds_preserve_unlimited_and_exhausted_periods() {
+        assert_eq!(
+            build_quota_thresholds(1_000, [u64::MAX, 0, 1, 100, 500, u64::MAX]),
+            [u64::MAX, 1_000, 1_001, 1_100, 1_500, u64::MAX]
+        );
+    }
 }

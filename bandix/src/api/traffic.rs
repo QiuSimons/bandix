@@ -1,5 +1,6 @@
 use super::{ApiResponse, HttpRequest, HttpResponse};
 use crate::command::Options;
+use crate::storage::quota::{TrafficQuota, TrafficQuotaManager, TrafficQuotaStatus};
 use crate::storage::traffic::{self, LongTermRingManager, RealtimeRingManager, ScheduledRateLimit, TimeSlot, save_all_scheduled_limits};
 use crate::utils::format_utils::{format_bytes, format_mac};
 use chrono::{DateTime, Utc};
@@ -323,6 +324,30 @@ pub struct DeleteDeviceRequest {
     pub mac: String,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct SetTrafficQuotaRequest {
+    pub mac: String,
+    /// Bytes allowed in the local minute/calendar periods. 0 = unlimited.
+    #[serde(default)]
+    pub minute_bytes: u64,
+    pub hourly_bytes: u64,
+    pub daily_bytes: u64,
+    pub weekly_bytes: u64,
+    pub monthly_bytes: u64,
+    /// Lifetime bytes since this device quota was first created. 0 = unlimited.
+    pub total_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteTrafficQuotaRequest {
+    pub mac: String,
+}
+
+#[derive(Serialize)]
+pub struct TrafficQuotasResponse {
+    pub quotas: Vec<TrafficQuotaStatus>,
+}
+
 #[derive(Clone)]
 pub struct TrafficApiHandler {
     scheduled_rate_limits: Arc<Mutex<Vec<ScheduledRateLimit>>>,
@@ -330,6 +355,7 @@ pub struct TrafficApiHandler {
     rate_limit_whitelist: Arc<Mutex<HashSet<[u8; 6]>>>,
     rate_limit_whitelist_enabled: Arc<AtomicBool>,
     default_wan_rate_limits: Arc<Mutex<[u64; 2]>>,
+    traffic_quota_manager: Arc<Mutex<TrafficQuotaManager>>,
     realtime_manager: Arc<RealtimeRingManager>,
     long_term_manager: Arc<LongTermRingManager>,
     device_manager: Arc<crate::device::DeviceManager>,
@@ -345,6 +371,7 @@ impl TrafficApiHandler {
         rate_limit_whitelist: Arc<Mutex<HashSet<[u8; 6]>>>,
         rate_limit_whitelist_enabled: Arc<AtomicBool>,
         default_wan_rate_limits: Arc<Mutex<[u64; 2]>>,
+        traffic_quota_manager: Arc<Mutex<TrafficQuotaManager>>,
         realtime_manager: Arc<RealtimeRingManager>,
         long_term_manager: Arc<LongTermRingManager>,
         device_manager: Arc<crate::device::DeviceManager>,
@@ -358,6 +385,7 @@ impl TrafficApiHandler {
             rate_limit_whitelist,
             rate_limit_whitelist_enabled,
             default_wan_rate_limits,
+            traffic_quota_manager,
             realtime_manager,
             long_term_manager,
             device_manager,
@@ -380,6 +408,7 @@ impl TrafficApiHandler {
             "/api/traffic/rate_limit/whitelist",
             "/api/traffic/rate_limit/whitelist/enabled",
             "/api/traffic/rate_limit/default",
+            "/api/traffic/quotas",
             "/api/traffic/persist",
         ]
     }
@@ -437,6 +466,12 @@ impl TrafficApiHandler {
             },
             "/api/traffic/rate_limit/default" => match request.method.as_str() {
                 "POST" => self.handle_rate_limit_set_default_limits(request).await,
+                _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
+            },
+            "/api/traffic/quotas" => match request.method.as_str() {
+                "GET" => self.handle_traffic_quotas_get().await,
+                "POST" | "PUT" => self.handle_traffic_quota_set(request).await,
+                "DELETE" => self.handle_traffic_quota_delete(request).await,
                 _ => Ok(HttpResponse::error(405, "Method not allowed".to_string())),
             },
             "/api/traffic/persist" => match request.method.as_str() {
@@ -576,9 +611,52 @@ impl TrafficApiHandler {
             ));
         }
         self.long_term_manager.flush_dirty_rings().await?;
+        self.traffic_quota_manager.lock().unwrap().save()?;
         let api_response = ApiResponse::success(());
         let body = serde_json::to_string(&api_response)?;
         Ok(HttpResponse::ok(body))
+    }
+
+    async fn handle_traffic_quotas_get(&self) -> Result<HttpResponse, anyhow::Error> {
+        let quotas = self.traffic_quota_manager.lock().unwrap().statuses(&chrono::Local::now());
+        let response = ApiResponse::success(TrafficQuotasResponse { quotas });
+        Ok(HttpResponse::ok(serde_json::to_string(&response)?))
+    }
+
+    async fn handle_traffic_quota_set(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+        let body = request.body.as_ref().ok_or_else(|| anyhow::anyhow!("Missing request body"))?;
+        let req: SetTrafficQuotaRequest = serde_json::from_str(body)?;
+        let mac = crate::utils::network_utils::parse_mac_address(&req.mac)?;
+        let mut manager = self.traffic_quota_manager.lock().unwrap();
+        manager.set_quota(
+            mac,
+            TrafficQuota {
+                minute_bytes: req.minute_bytes,
+                hourly_bytes: req.hourly_bytes,
+                daily_bytes: req.daily_bytes,
+                weekly_bytes: req.weekly_bytes,
+                monthly_bytes: req.monthly_bytes,
+                total_bytes: req.total_bytes,
+            },
+            &chrono::Local::now(),
+        );
+        manager.save()?;
+        let status = manager.status(&mac, &chrono::Local::now()).unwrap();
+        let response = ApiResponse::success(status);
+        Ok(HttpResponse::ok(serde_json::to_string(&response)?))
+    }
+
+    async fn handle_traffic_quota_delete(&self, request: &HttpRequest) -> Result<HttpResponse, anyhow::Error> {
+        let body = request.body.as_ref().ok_or_else(|| anyhow::anyhow!("Missing request body"))?;
+        let req: DeleteTrafficQuotaRequest = serde_json::from_str(body)?;
+        let mac = crate::utils::network_utils::parse_mac_address(&req.mac)?;
+        let mut manager = self.traffic_quota_manager.lock().unwrap();
+        if !manager.remove_quota(&mac) {
+            return Ok(HttpResponse::error(404, "Traffic quota not found".to_string()));
+        }
+        manager.save()?;
+        let response = ApiResponse::success(());
+        Ok(HttpResponse::ok(serde_json::to_string(&response)?))
     }
 }
 
@@ -861,6 +939,13 @@ impl TrafficApiHandler {
         traffic::delete_scheduled_limits_by_mac(self.options.data_dir(), &mac)?;
 
         {
+            let mut quotas = self.traffic_quota_manager.lock().unwrap();
+            if quotas.remove_quota(&mac) {
+                quotas.save()?;
+            }
+        }
+
+        {
             let mut last_ebpf = self.last_ebpf_traffic.lock().unwrap();
             last_ebpf.remove(&mac);
         }
@@ -878,6 +963,16 @@ impl TrafficApiHandler {
             }
             if let Ok(mut rate_buckets) = aya::maps::HashMap::<_, [u8; 6], [u64; 3]>::try_from(ebpf_mut.map_mut("RATE_BUCKETS").ok_or_else(|| anyhow::anyhow!("RATE_BUCKETS map not found"))?) {
                 let _ = rate_buckets.remove(&mac);
+            }
+            if let Ok(mut quota_blocked) = aya::maps::HashMap::<_, [u8; 6], u8>::try_from(ebpf_mut.map_mut("MAC_QUOTA_BLOCKED").ok_or_else(|| anyhow::anyhow!("MAC_QUOTA_BLOCKED map not found"))?) {
+                let _ = quota_blocked.remove(&mac);
+            }
+            if let Ok(mut quota_thresholds) = aya::maps::HashMap::<_, [u8; 6], [u64; 6]>::try_from(
+                ebpf_mut
+                    .map_mut("MAC_QUOTA_THRESHOLDS")
+                    .ok_or_else(|| anyhow::anyhow!("MAC_QUOTA_THRESHOLDS map not found"))?,
+            ) {
+                let _ = quota_thresholds.remove(&mac);
             }
         }
 
